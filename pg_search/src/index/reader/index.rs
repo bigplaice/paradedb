@@ -38,15 +38,15 @@ use crate::schema::SearchIndexSchema;
 use anyhow::Result;
 use tantivy::aggregation::intermediate_agg_result::IntermediateAggregationResults;
 use tantivy::aggregation::DistributedAggregationCollector;
-use tantivy::collector::{
-    Collector, Feature, FieldFeature, ScoreFeature, SegmentCollector, TopDocs, TopOrderable,
+use tantivy::collector::sort_key::{
+    SortByOwnedValue, SortBySimilarityScore, SortByStaticFastValue, SortByString,
 };
-use tantivy::fastfield::FastValue;
+use tantivy::collector::{Collector, SegmentCollector, SortKeyComputer, TopDocs};
 use tantivy::index::{Index, SegmentId};
 use tantivy::query::{EnableScoring, QueryClone, QueryParser, Weight};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{
-    query::Query, schema::OwnedValue, DocAddress, DocId, DocSet, Executor, IndexReader,
+    query::Query, schema::OwnedValue, DateTime, DocAddress, DocId, DocSet, Executor, IndexReader,
     ReloadPolicy, Score, Searcher, SegmentOrdinal, SegmentReader, TantivyDocument,
 };
 
@@ -83,9 +83,6 @@ type TopNWithAggregate<T> = (
     Vec<((T, Option<Score>), DocAddress)>,
     Option<IntermediateAggregationResults>,
 );
-
-/// See `SearchIndexReader::prepare_features`.
-type ErasedFeature = Arc<dyn Feature<Output = OwnedValue, SegmentOutput = Option<u64>>>;
 
 /// A known-size iterator of results for Top-N.
 pub struct TopNSearchResults {
@@ -176,7 +173,7 @@ pub struct MultiSegmentSearchResults {
 }
 
 /// A score which sorts in ascending direction.
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Debug)]
 pub struct AscendingScore {
     score: Score,
 }
@@ -593,7 +590,7 @@ impl SearchIndexReader {
                         &self.searcher,
                         self.top_in_segments(
                             segment_ids,
-                            FieldFeature::string(sort_field),
+                            SortByString::for_field(sort_field),
                             *direction,
                             erased_features,
                             n,
@@ -605,7 +602,7 @@ impl SearchIndexReader {
                         &self.searcher,
                         self.top_in_segments(
                             segment_ids,
-                            FieldFeature::u64(sort_field),
+                            SortByStaticFastValue::<u64>::for_field(sort_field),
                             *direction,
                             erased_features,
                             n,
@@ -617,7 +614,7 @@ impl SearchIndexReader {
                         &self.searcher,
                         self.top_in_segments(
                             segment_ids,
-                            FieldFeature::i64(sort_field),
+                            SortByStaticFastValue::<i64>::for_field(sort_field),
                             *direction,
                             erased_features,
                             n,
@@ -629,7 +626,7 @@ impl SearchIndexReader {
                         &self.searcher,
                         self.top_in_segments(
                             segment_ids,
-                            FieldFeature::f64(sort_field),
+                            SortByStaticFastValue::<f64>::for_field(sort_field),
                             *direction,
                             erased_features,
                             n,
@@ -641,7 +638,7 @@ impl SearchIndexReader {
                         &self.searcher,
                         self.top_in_segments(
                             segment_ids,
-                            FieldFeature::bool(sort_field),
+                            SortByStaticFastValue::<bool>::for_field(sort_field),
                             *direction,
                             erased_features,
                             n,
@@ -653,7 +650,7 @@ impl SearchIndexReader {
                         &self.searcher,
                         self.top_in_segments(
                             segment_ids,
-                            FieldFeature::datetime(sort_field),
+                            SortByStaticFastValue::<DateTime>::for_field(sort_field),
                             *direction,
                             erased_features,
                             n,
@@ -676,7 +673,7 @@ impl SearchIndexReader {
                 // If we've directly sorted on the score, then we have it available here.
                 let (top_docs, aggregation_results) = self.top_in_segments(
                     segment_ids,
-                    ScoreFeature,
+                    SortBySimilarityScore,
                     *direction,
                     erased_features,
                     n,
@@ -703,7 +700,7 @@ impl SearchIndexReader {
     /// Called by `search_top_n_in_segments`.
     ///
     /// `search_top_n_in_segments` is specialized for all combinations of:
-    /// 1. first sort field type -- via the generic `F: Feature` parameter of this method. This
+    /// 1. first sort field type -- via the generic `S: SortKeyComputer` parameter of this method. This
     ///    gets us unboxed/optimized comparison for the first feature, which always receives more
     ///    comparison than the remaining features (sometimes a lot more).
     /// 2. supported sort field counts (from 1 to MAX_TOPN_FEATURES) -- by calls to
@@ -713,37 +710,34 @@ impl SearchIndexReader {
     ///
     /// To avoid a combinatorial explosion of generated code we do not support specializing more
     /// than the first sort field type: to do so, we'd likely need a macro which generated all
-    /// possible permutations of `F: Feature` types for three columns (which would be 7^3=343 copies
+    /// possible permutations of `S: SortKeyComputer` types for three columns (which would be 7^3=343 copies
     /// of the method at time of writing).
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn top_in_segments<F>(
+    fn top_in_segments<S>(
         &self,
         segment_ids: impl Iterator<Item = SegmentId>,
-        first_feature: F,
+        first_feature: S,
         first_sortdir: SortDirection,
         mut erased_features: ErasedFeatures,
         n: usize,
         offset: usize,
         aux_collector: Option<TopNAuxiliaryCollector>,
-    ) -> TopNWithAggregate<F::Output>
+    ) -> TopNWithAggregate<S::SortKey>
     where
-        F: Feature + Clone,
+        S: SortKeyComputer + Clone + Send + 'static,
     {
         // if last erased feature is score, then we need to return the score
         match erased_features.len() {
             0 => {
                 let (top_docs, aggregation_results) = self.top_for_orderable_in_segments(
                     segment_ids,
-                    ((first_feature, first_sortdir.into()),),
+                    (first_feature, first_sortdir.into()),
                     n,
                     offset,
                     aux_collector,
                 );
                 (
-                    top_docs
-                        .into_iter()
-                        .map(|((f,), doc)| ((f, None), doc))
-                        .collect(),
+                    top_docs.into_iter().map(|(f, doc)| (f, doc)).collect(),
                     aggregation_results,
                 )
             }
@@ -814,23 +808,23 @@ impl SearchIndexReader {
     }
 
     /// See `top_in_segments` and `search_top_n_in_segments`.
-    fn top_for_orderable_in_segments<O>(
+    fn top_for_orderable_in_segments<S>(
         &self,
         segment_ids: impl Iterator<Item = SegmentId>,
-        orderable: O,
+        sort_key_computer: S,
         n: usize,
         offset: usize,
         aux_collector: Option<TopNAuxiliaryCollector>,
     ) -> (
-        Vec<(O::Output, DocAddress)>,
+        Vec<(S::SortKey, DocAddress)>,
         Option<IntermediateAggregationResults>,
     )
     where
-        O: TopOrderable,
+        S: SortKeyComputer + Send + 'static,
     {
         let top_docs_collector = TopDocs::with_limit(n)
             .and_offset(offset)
-            .order_by(orderable);
+            .order_by(sort_key_computer);
 
         self.collect_maybe_auxiliary(segment_ids, top_docs_collector, aux_collector)
     }
@@ -871,9 +865,9 @@ impl SearchIndexReader {
                 )
             }
 
-            // can use tantivy's score directly
+            // can use tantivy's score directly, which allows for Block-WAND
             SortDirection::Desc => {
-                let top_docs_collector = TopDocs::with_limit(n).and_offset(offset);
+                let top_docs_collector = TopDocs::with_limit(n).and_offset(offset).order_by_score();
 
                 let (top_docs, aggregation_results) =
                     self.collect_maybe_auxiliary(segment_ids, top_docs_collector, aux_collector);
@@ -1103,8 +1097,8 @@ impl SearchIndexReader {
     ///
     /// See `top_in_segments` and `sort_features!`.
     ///
-    /// Additionally, if we need scores, this method will ensure that at least one of these features is a ScoreFeature
-    /// (see comment within function below)
+    /// Additionally, if we need scores, this method will ensure that at least one of
+    /// these features is a SortBySimilarityScore (see comment within function below)
     fn prepare_features<'a>(
         &'_ self,
         orderby_infos: &'a [OrderByInfo],
@@ -1121,30 +1115,9 @@ impl SearchIndexReader {
                     direction,
                     .. // TODO(#3266): Handle nulls_first for ORDER BY field sorting
                 } => {
-                    let field = self
-                        .schema
-                        .search_field(sort_field)
-                        .expect("sort field should exist in index schema");
-
-                    match field.field_entry().field_type().value_type() {
-                        tantivy::schema::Type::Str => erased_features
-                            .push_string_feature(FieldFeature::string(sort_field), *direction),
-                        tantivy::schema::Type::U64 => erased_features
-                            .push_ff_feature(FieldFeature::u64(sort_field), *direction),
-                        tantivy::schema::Type::I64 => erased_features
-                            .push_ff_feature(FieldFeature::i64(sort_field), *direction),
-                        tantivy::schema::Type::F64 => erased_features
-                            .push_ff_feature(FieldFeature::f64(sort_field), *direction),
-                        tantivy::schema::Type::Bool => erased_features
-                            .push_ff_feature(FieldFeature::bool(sort_field), *direction),
-                        tantivy::schema::Type::Date => erased_features
-                            .push_ff_feature(FieldFeature::datetime(sort_field), *direction),
-                        x => {
-                            // NOTE: This list of supported field types must be synced with
-                            // `SearchField::is_sortable`.
-                            panic!("Unsupported order-by field type: {x:?}");
-                        }
-                    };
+                    // NOTE: The list of supported field types for `SortByOwnedValue` must be synced with
+                    // `SearchField::is_sortable`.
+                    erased_features.push_feature(SortByOwnedValue::for_field(sort_field), *direction);
                 }
                 OrderByInfo {
                     feature: OrderByFeature::Score,
@@ -1216,7 +1189,7 @@ pub(super) fn enable_scoring(need_scores: bool, searcher: &Searcher) -> EnableSc
 
 #[derive(Default)]
 pub struct ErasedFeatures {
-    features: Vec<(ErasedFeature, SortDirection)>,
+    features: Vec<(SortByOwnedValue, SortDirection)>,
     // which, if any, of the erased features is the score feature
     // note: once https://github.com/quickwit-oss/tantivy/pull/2681#issuecomment-3340222261 is resolved,
     // this will be unnecessary
@@ -1232,25 +1205,20 @@ impl ErasedFeatures {
         self.features.is_empty()
     }
 
-    pub fn pop(&mut self) -> Option<(ErasedFeature, SortDirection)> {
+    pub fn pop(&mut self) -> Option<(SortByOwnedValue, SortDirection)> {
         self.features.pop()
     }
 
-    pub fn push_ff_feature<T: FastValue>(
-        &mut self,
-        feature: FieldFeature<T>,
-        direction: SortDirection,
-    ) {
-        self.features.push((feature.erased(), direction));
+    /// Push a non-score feature.
+    pub fn push_feature(&mut self, feature: SortByOwnedValue, direction: SortDirection) {
+        self.features.push((feature, direction));
     }
 
-    pub fn push_string_feature(&mut self, feature: FieldFeature<String>, direction: SortDirection) {
-        self.features.push((feature.erased(), direction));
-    }
-
+    /// Push a score feature.
     pub fn push_score_feature(&mut self, direction: SortDirection) {
         self.score_index = Some(self.features.len());
-        self.features.push((ScoreFeature.erased(), direction));
+        self.features
+            .push((SortByOwnedValue::for_score(), direction));
     }
 
     pub fn score_index(&self) -> Option<usize> {
