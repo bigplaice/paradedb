@@ -113,6 +113,6 @@ jobs:
           config_image: us-central1-docker.pkg.dev/molten-verve-216720/paradedb-repository/paradedb-config@${{ steps.build-push-config.outputs.digest }}
           images: us-central1-docker.pkg.dev/molten-verve-216720/paradedb-repository/paradedb@${{ steps.build-push-workload.outputs.digest }}
           description: "[${{ github.repository }}] CI for ${{ github.ref_name }} (commit ${{ github.sha }})"
-          email_recipients: "developers@paradedb.com"
+          email_recipients: developers@paradedb.com
           additional_parameters: |-
             antithesis.duration=${{ github.event.inputs.duration || '10' }}
