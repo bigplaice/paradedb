@@ -43,7 +43,7 @@ jobs:
       - name: Trigger Antithesis Multiverse Debugger Session
         uses: antithesishq/antithesis-trigger-action@main
         with:
-          notebook_name: basic_k8s_test
+          notebook_name: debugging
           tenant: paradedb
           username: ${{ secrets.ANTITHESIS_USERNAME }}
           password: ${{ secrets.ANTITHESIS_PASSWORD }}
