@@ -729,13 +729,13 @@ impl SearchIndexReader {
         // if last erased feature is score, then we need to return the score
         match erased_features.len() {
             0 => {
-                let (top_docs, aggregation_results) = self.top_for_orderable_in_segments(
-                    segment_ids,
-                    (first_feature, first_sortdir.into()),
-                    n,
-                    offset,
-                    aux_collector,
-                );
+                let top_docs_collector = TopDocs::with_limit(n)
+                    .and_offset(offset)
+                    .order_by((first_feature, first_sortdir.into()));
+
+                let (top_docs, aggregation_results) =
+                    self.collect_maybe_auxiliary(segment_ids, top_docs_collector, aux_collector);
+
                 (
                     top_docs.into_iter().map(|(f, doc)| (f, doc)).collect(),
                     aggregation_results,
@@ -743,16 +743,13 @@ impl SearchIndexReader {
             }
             1 => {
                 let erased_feature = erased_features.pop().unwrap();
-                let (top_docs, aggregation_results) = self.top_for_orderable_in_segments(
-                    segment_ids,
-                    (
-                        (first_feature, first_sortdir.into()),
-                        (erased_feature.0, erased_feature.1.into()),
-                    ),
-                    n,
-                    offset,
-                    aux_collector,
-                );
+                let top_docs_collector = TopDocs::with_limit(n).and_offset(offset).order_by((
+                    (first_feature, first_sortdir.into()),
+                    (erased_feature.0, erased_feature.1.into()),
+                ));
+
+                let (top_docs, aggregation_results) =
+                    self.collect_maybe_auxiliary(segment_ids, top_docs_collector, aux_collector);
 
                 (
                     top_docs
@@ -766,30 +763,33 @@ impl SearchIndexReader {
                 )
             }
             2 => {
-                let erased_feature2 = erased_features.pop().unwrap();
-                let erased_feature1 = erased_features.pop().unwrap();
-                let (top_docs, aggregation_results) = self.top_for_orderable_in_segments(
-                    segment_ids,
-                    (
-                        (first_feature, first_sortdir.into()),
-                        (erased_feature1.0, erased_feature1.1.into()),
-                        (erased_feature2.0, erased_feature2.1.into()),
-                    ),
-                    n,
-                    offset,
-                    aux_collector,
-                );
+                todo!("Fix 2 erased features.")
+                /*
+                  let erased_feature2 = erased_features.pop().unwrap();
+                  let erased_feature1 = erased_features.pop().unwrap();
+                  let (top_docs, aggregation_results): (Vec<((S::SortKey, OwnedValue, OwnedValue), DocAddress)>, _) = self.top_for_orderable_in_segments(
+                      segment_ids,
+                      (
+                          (first_feature, first_sortdir.into()),
+                          (erased_feature1.0, erased_feature1.1.into()),
+                          (erased_feature2.0, erased_feature2.1.into()),
+                      ),
+                      n,
+                      offset,
+                      aux_collector,
+                  );
 
-                (
-                    top_docs
-                        .into_iter()
-                        .map(|((f, erased1, erased2), doc)| {
-                            let maybe_score = erased_features.try_get_score(&[erased1, erased2]);
-                            ((f, maybe_score), doc)
-                        })
-                        .collect(),
-                    aggregation_results,
-                )
+                  (
+                      top_docs
+                          .into_iter()
+                          .map(|((f, erased1, erased2), doc)| {
+                              let maybe_score = erased_features.try_get_score(&[erased1, erased2]);
+                              ((f, maybe_score), doc)
+                          })
+                          .collect(),
+                      aggregation_results,
+                  )
+                */
             }
             x => {
                 if erased_features.score_index() == Some(x - 1) {
@@ -807,33 +807,14 @@ impl SearchIndexReader {
         }
     }
 
-    /// See `top_in_segments` and `search_top_n_in_segments`.
-    fn top_for_orderable_in_segments<S>(
-        &self,
-        segment_ids: impl Iterator<Item = SegmentId>,
-        sort_key_computer: S,
-        n: usize,
-        offset: usize,
-        aux_collector: Option<TopNAuxiliaryCollector>,
-    ) -> (
-        Vec<(S::SortKey, DocAddress)>,
-        Option<IntermediateAggregationResults>,
-    )
-    where
-        S: SortKeyComputer + Send + 'static,
-    {
-        let top_docs_collector = TopDocs::with_limit(n)
-            .and_offset(offset)
-            .order_by(sort_key_computer);
-
-        self.collect_maybe_auxiliary(segment_ids, top_docs_collector, aux_collector)
-    }
-
     /// Order by score only.
     ///
-    /// TODO: This is a special case for a single score feature: the score-only codepath is highly
-    /// specialized, and at least 50% faster than `TopDocs::order_by` when sorting on only the
-    /// score. We should try to close that gap over time, but for now we special case it.
+    /// NOTE: This is a special case for a single score feature: the score-only codepath is highly
+    /// specializedi due to Block-WAND, and at least 50% faster than `TopDocs::order_by` when
+    /// sorting on only the score. We should try to close that gap over time, but for now we
+    /// special case it.
+    ///
+    /// TODO: Confirm after rebasing atop https://github.com/quickwit-oss/tantivy/pull/2726
     fn top_by_score_in_segments(
         &self,
         segment_ids: impl Iterator<Item = SegmentId>,
