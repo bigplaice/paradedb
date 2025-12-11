@@ -47,7 +47,7 @@ use tantivy::query::{EnableScoring, QueryClone, QueryParser, Weight};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{
     query::Query, schema::OwnedValue, DateTime, DocAddress, DocId, DocSet, Executor, IndexReader,
-    ReloadPolicy, Score, Searcher, SegmentOrdinal, SegmentReader, TantivyDocument,
+    Order, ReloadPolicy, Score, Searcher, SegmentOrdinal, SegmentReader, TantivyDocument,
 };
 
 /// The maximum number of sort-features/`OrderByInfo`s supported for
@@ -585,13 +585,13 @@ impl SearchIndexReader {
                     .schema
                     .search_field(sort_field)
                     .expect("sort field should exist in index schema");
+                let order: Order = (*direction).into();
                 match field.field_entry().field_type().value_type() {
                     tantivy::schema::Type::Str => TopNSearchResults::new_for_discarded_field(
                         &self.searcher,
                         self.top_in_segments(
                             segment_ids,
-                            SortByString::for_field(sort_field),
-                            *direction,
+                            (SortByString::for_field(sort_field), order),
                             erased_features,
                             n,
                             offset,
@@ -602,8 +602,7 @@ impl SearchIndexReader {
                         &self.searcher,
                         self.top_in_segments(
                             segment_ids,
-                            SortByStaticFastValue::<u64>::for_field(sort_field),
-                            *direction,
+                            (SortByStaticFastValue::<u64>::for_field(sort_field), order),
                             erased_features,
                             n,
                             offset,
@@ -614,8 +613,7 @@ impl SearchIndexReader {
                         &self.searcher,
                         self.top_in_segments(
                             segment_ids,
-                            SortByStaticFastValue::<i64>::for_field(sort_field),
-                            *direction,
+                            (SortByStaticFastValue::<i64>::for_field(sort_field), order),
                             erased_features,
                             n,
                             offset,
@@ -626,8 +624,7 @@ impl SearchIndexReader {
                         &self.searcher,
                         self.top_in_segments(
                             segment_ids,
-                            SortByStaticFastValue::<f64>::for_field(sort_field),
-                            *direction,
+                            (SortByStaticFastValue::<f64>::for_field(sort_field), order),
                             erased_features,
                             n,
                             offset,
@@ -638,8 +635,7 @@ impl SearchIndexReader {
                         &self.searcher,
                         self.top_in_segments(
                             segment_ids,
-                            SortByStaticFastValue::<bool>::for_field(sort_field),
-                            *direction,
+                            (SortByStaticFastValue::<bool>::for_field(sort_field), order),
                             erased_features,
                             n,
                             offset,
@@ -650,8 +646,7 @@ impl SearchIndexReader {
                         &self.searcher,
                         self.top_in_segments(
                             segment_ids,
-                            SortByStaticFastValue::<DateTime>::for_field(sort_field),
-                            *direction,
+                            (SortByStaticFastValue::<DateTime>::for_field(sort_field), order),
                             erased_features,
                             n,
                             offset,
@@ -671,10 +666,10 @@ impl SearchIndexReader {
                 .. // TODO(#3266): Handle nulls_first for ORDER BY score sorting
             } if !erased_features.is_empty() => {
                 // If we've directly sorted on the score, then we have it available here.
+                let order: Order = (*direction).into();
                 let (top_docs, aggregation_results) = self.top_in_segments(
                     segment_ids,
-                    SortBySimilarityScore,
-                    *direction,
+                    (SortBySimilarityScore, order),
                     erased_features,
                     n,
                     offset,
@@ -717,7 +712,6 @@ impl SearchIndexReader {
         &self,
         segment_ids: impl Iterator<Item = SegmentId>,
         first_feature: S,
-        first_sortdir: SortDirection,
         mut erased_features: ErasedFeatures,
         n: usize,
         offset: usize,
@@ -731,22 +725,24 @@ impl SearchIndexReader {
             0 => {
                 let top_docs_collector = TopDocs::with_limit(n)
                     .and_offset(offset)
-                    .order_by((first_feature, first_sortdir.into()));
+                    .order_by::<S::SortKey>(first_feature);
 
                 let (top_docs, aggregation_results) =
                     self.collect_maybe_auxiliary(segment_ids, top_docs_collector, aux_collector);
 
                 (
-                    top_docs.into_iter().map(|(f, doc)| (f, doc)).collect(),
+                    top_docs
+                        .into_iter()
+                        .map(|(f, doc)| ((f, None), doc))
+                        .collect(),
                     aggregation_results,
                 )
             }
             1 => {
                 let erased_feature = erased_features.pop().unwrap();
-                let top_docs_collector = TopDocs::with_limit(n).and_offset(offset).order_by((
-                    (first_feature, first_sortdir.into()),
-                    (erased_feature.0, erased_feature.1.into()),
-                ));
+                let top_docs_collector = TopDocs::with_limit(n)
+                    .and_offset(offset)
+                    .order_by((first_feature, erased_feature));
 
                 let (top_docs, aggregation_results) =
                     self.collect_maybe_auxiliary(segment_ids, top_docs_collector, aux_collector);
@@ -763,33 +759,27 @@ impl SearchIndexReader {
                 )
             }
             2 => {
-                todo!("Fix 2 erased features.")
-                /*
-                  let erased_feature2 = erased_features.pop().unwrap();
-                  let erased_feature1 = erased_features.pop().unwrap();
-                  let (top_docs, aggregation_results): (Vec<((S::SortKey, OwnedValue, OwnedValue), DocAddress)>, _) = self.top_for_orderable_in_segments(
-                      segment_ids,
-                      (
-                          (first_feature, first_sortdir.into()),
-                          (erased_feature1.0, erased_feature1.1.into()),
-                          (erased_feature2.0, erased_feature2.1.into()),
-                      ),
-                      n,
-                      offset,
-                      aux_collector,
-                  );
+                let erased_feature2 = erased_features.pop().unwrap();
+                let erased_feature1 = erased_features.pop().unwrap();
+                let top_docs_collector = TopDocs::with_limit(n).and_offset(offset).order_by((
+                    first_feature,
+                    erased_feature1,
+                    erased_feature2,
+                ));
 
-                  (
-                      top_docs
-                          .into_iter()
-                          .map(|((f, erased1, erased2), doc)| {
-                              let maybe_score = erased_features.try_get_score(&[erased1, erased2]);
-                              ((f, maybe_score), doc)
-                          })
-                          .collect(),
-                      aggregation_results,
-                  )
-                */
+                let (top_docs, aggregation_results) =
+                    self.collect_maybe_auxiliary(segment_ids, top_docs_collector, aux_collector);
+
+                (
+                    top_docs
+                        .into_iter()
+                        .map(|((f, erased1, erased2), doc)| {
+                            let maybe_score = erased_features.try_get_score(&[erased1, erased2]);
+                            ((f, maybe_score), doc)
+                        })
+                        .collect(),
+                    aggregation_results,
+                )
             }
             x => {
                 if erased_features.score_index() == Some(x - 1) {
@@ -1186,8 +1176,11 @@ impl ErasedFeatures {
         self.features.is_empty()
     }
 
-    pub fn pop(&mut self) -> Option<(SortByOwnedValue, SortDirection)> {
-        self.features.pop()
+    pub fn pop(&mut self) -> Option<(SortByOwnedValue, Order)> {
+        self.features.pop().map(|(s, sort_direction)| {
+            let order: Order = sort_direction.into();
+            (s, order)
+        })
     }
 
     /// Push a non-score feature.
