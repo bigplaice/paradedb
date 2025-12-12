@@ -32,3 +32,4 @@ tantivy-jieba = "0.17.0"
 
 [patch.crates-io]
 tantivy-tokenizer-api = { git = "https://github.com/paradedb/tantivy.git", package = "tantivy-tokenizer-api", rev = "a7329cccff6c147376fbfdaa2c1db5380f569156" }
+jieba-rs = { git = "https://github.com/bigplaice/jieba-rs.git", package = "jieba-rs", rev = "d6072bbe4616b976d0aae5740f726e9da539423e" } 
