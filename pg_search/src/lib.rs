@@ -298,3 +298,104 @@ use std::path::{PathBuf};
         format!("词条 '{}' 已存在且无需修改，无操作执行", word)
     }
 }
+
+/// TODO: 批量更新或添加用户自定义词典中的词条
+///
+/// 参数：word_array: &[&str]，每个元素格式为：
+///   "关键词"                → 添加/更新词条，使用默认词频 1000，无词性
+///   "关键词,词频"           → 指定词频，无词性
+///   "关键词,词频,词性"      → 指定词频和词性
+///
+/// 返回：字符串，描述所有操作的结果（多行）
+//fn update_or_add_user_dict(words: VariadicArray<Option<&str>>) -> String {
+
+#[pg_extern]
+fn delete_from_user_dict(words: VariadicArray<&str>) -> String {
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::collections::HashSet;
+
+    let words_vec: Vec<&str> = words
+        .iter()
+        .flatten()  // 跳过 NULL 值（如果有）
+        .collect();
+
+    if words_vec.is_empty() {
+        return "未提供要删除的词条".to_string();
+    }
+
+    // 使用 HashSet 快速检查
+    let delete_set: HashSet<&str> = words_vec.iter().copied().collect();
+
+    // 获取当前可执行文件路径
+    let exe_path = match env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return format!("无法获取可执行文件路径: {}", e),
+    };
+
+    let exe_dir = match exe_path.parent() {
+        Some(d) => d,
+        None => return "无法获取可执行文件目录".to_string(),
+    };
+
+    // 构造路径: <exe_dir>/../share/postgresql/user_dict.txt
+    let mut file_path = PathBuf::from(exe_dir);
+    file_path.push("..");
+    file_path.push("share");
+    file_path.push("postgresql");
+    file_path.push("user_dict.txt");
+
+    // 规范化路径
+    let file_path = match file_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return "无法规范化文件路径".to_string(),
+    };
+
+    // 文件不存在
+    if !file_path.exists() {
+        return format!("文件不存在: {}", file_path.display());
+    }
+
+    // 读取文件内容
+    let content = match fs::read_to_string(&file_path) {
+        Ok(c) => c,
+        Err(e) => return format!("读取文件失败: {}", e),
+    };
+
+    // 收集要保留的行
+    let mut new_lines: Vec<String> = Vec::new();
+    let mut deleted_count = 0;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            // 保留空行和注释
+            new_lines.push(line.to_string());
+            continue;
+        }
+
+        if let Some(entry) = trimmed.split_whitespace().next() {
+            if delete_set.contains(entry) {
+                // 匹配，删除该行（不push）
+                deleted_count += 1;
+                continue;
+            }
+        }
+
+        // 不匹配，保留
+        new_lines.push(line.to_string());
+    }
+
+    if deleted_count == 0 {
+        return "未找到匹配的词条，未进行删除".to_string();
+    }
+
+    // 写回文件
+    let new_content = new_lines.join("\n") + "\n";
+
+    match fs::write(&file_path, new_content) {
+        Ok(_) => format!("成功删除 {} 个词条并保存文件: {}", deleted_count, file_path.display()),
+        Err(e) => format!("写入文件失败: {}", e),
+    }
+}
